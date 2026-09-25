@@ -7,86 +7,92 @@ import java.math.BigDecimal;
 
 public final class MySQLBackend extends AbstractJdbcJsonBackend {
 
-    private final String url;
+    private final String host;
+    private final int port;
+    private final String database;
     private final String username;
     private final String password;
+    private final int poolSize;
 
     public MySQLBackend(String host, int port, String database, String username, String password) {
+        this(host, port, database, username, password, 10);
+    }
+
+    public MySQLBackend(String host, int port, String database, String username, String password, int poolSize) {
         if (host == null || host.isBlank()) {
-            throw new IllegalArgumentException("Host cannot be blank");
+            throw new IllegalArgumentException("MySQL host cannot be blank");
+        }
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("MySQL port must be between 1 and 65535");
         }
         if (database == null || database.isBlank()) {
-            throw new IllegalArgumentException("Database cannot be blank");
+            throw new IllegalArgumentException("MySQL database cannot be blank");
         }
-
-        this.url = "jdbc:mysql://" + host + ":" + port + "/" + database
-                + "?useSSL=false&characterEncoding=utf8mb4&serverTimezone=UTC";
+        if (username == null || username.isBlank()) {
+            throw new IllegalArgumentException("MySQL username cannot be blank");
+        }
+        if (poolSize < 1) {
+            throw new IllegalArgumentException("MySQL pool size must be greater than zero");
+        }
+        this.host = host;
+        this.port = port;
+        this.database = database;
         this.username = username;
-        this.password = password;
+        this.password = password == null ? "" : password;
+        this.poolSize = poolSize;
     }
 
     @Override
-    public String jdbcUrl() {
-        return url;
+    protected String jdbcUrl() {
+        return "jdbc:mysql://" + this.host + ":" + this.port + "/" + this.database + "?useSSL=false&characterEncoding=utf8&serverTimezone=UTC";
     }
 
     @Override
-    public void configure(HikariConfig config) {
-        config.setUsername(username);
-        config.setPassword(password);
-        config.setMaximumPoolSize(10);
-        config.setMinimumIdle(2);
-        config.setConnectionTimeout(5000);
-        config.setValidationTimeout(3000);
+    protected void configure(HikariConfig config) {
+        config.setPoolName("mPersistence-MySQL");
+        config.setMaximumPoolSize(this.poolSize);
+        config.setMinimumIdle(Math.min(2, this.poolSize));
+        config.setUsername(this.username);
+        config.setPassword(this.password);
     }
 
     @Override
-    public String createTableSql(String entity) {
-        return """
-                CREATE TABLE IF NOT EXISTS %s (
-                    `id` VARCHAR(191) NOT NULL,
-                    `data` JSON NOT NULL,
-                    PRIMARY KEY (`id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """.formatted(quote(entity));
+    protected String createTableSql(String entity) {
+        return "CREATE TABLE IF NOT EXISTS %s (`id` VARCHAR(255) NOT NULL PRIMARY KEY, `data` JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci".formatted(this.quote(entity));
     }
 
     @Override
-    public String upsertSql(String entity) {
-        return """
-                INSERT INTO %s (`id`, `data`)
-                VALUES (?, ?)
-                ON DUPLICATE KEY UPDATE `data` = VALUES(`data`)
-                """.formatted(quote(entity));
+    protected String upsertSql(String entity) {
+        return "INSERT INTO %s (`id`, `data`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `data` = VALUES(`data`)".formatted(this.quote(entity));
     }
 
     @Override
-    public String jsonValueExpression(String field, SortValueType valueType) {
-        if ("_id".equals(field)) {
-            return "`id`";
-        }
-        String expression = "JSON_UNQUOTE(JSON_EXTRACT(`data`, '" + jsonPath(field) + "'))";
-        return valueType == SortValueType.NUMBER ? "CAST(" + expression + " AS DECIMAL(65,20))" : expression;
+    protected String jsonValueExpression(String field, SortValueType valueType) {
+        String expression = "JSON_UNQUOTE(JSON_EXTRACT(`data`, '" + this.jsonPath(field) + "'))";
+        return switch (valueType) {
+            case RAW, STRING -> expression;
+            case NUMBER -> "CAST(" + expression + " AS DECIMAL(65,20))";
+        };
     }
 
     @Override
-    public String jsonExistsExpression(String field) {
-        return "JSON_CONTAINS_PATH(`data`, 'one', '" + jsonPath(field) + "')";
+    protected String jsonExistsExpression(String field) {
+        return "JSON_CONTAINS_PATH(`data`, 'one', '" + this.jsonPath(field) + "')";
     }
 
     @Override
-    public String jsonIsNullExpression(String field) {
-        return "JSON_TYPE(`data`, '" + jsonPath(field) + "') = 'NULL'";
+    protected String jsonIsNullExpression(String field) {
+        return "JSON_CONTAINS_PATH(`data`, 'one', '" + this.jsonPath(field) + "') AND JSON_TYPE(JSON_EXTRACT(`data`, '" + this.jsonPath(field) + "')) = 'NULL'";
     }
 
     @Override
-    public String jsonIsNotNullExpression(String field) {
-        return "JSON_CONTAINS_PATH(`data`, 'one', '" + jsonPath(field) + "')" + " AND JSON_TYPE(`data`, '" + jsonPath(field) + "') <> 'NULL'";
+    protected String jsonIsNotNullExpression(String field) {
+        return "JSON_CONTAINS_PATH(`data`, 'one', '" + this.jsonPath(field) + "') AND JSON_TYPE(JSON_EXTRACT(`data`, '" + this.jsonPath(field) + "')) <> 'NULL'";
     }
 
     @Override
-    public Object sqlValue(Object value) {
-        Object normalized = normalizeSqlValue(value);
+    protected Object sqlValue(Object value) {
+        Object normalized = this.normalizeSqlValue(value);
         if (normalized instanceof Boolean bool) {
             return bool ? "true" : "false";
         }

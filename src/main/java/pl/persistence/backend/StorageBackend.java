@@ -10,19 +10,15 @@ public interface StorageBackend extends AutoCloseable {
 
     void ensureEntity(String entity);
 
-    List<StoredEntity> find(String entity, QuerySpec spec);
+    List<StoredEntity> find(String entity, QuerySpec query);
 
-    long count(String entity, QuerySpec spec);
+    long count(String entity, QuerySpec query);
 
-    long delete(String entity, QuerySpec spec);
+    long delete(String entity, QuerySpec query);
 
     void save(StoredEntity entity);
 
-    void deleteById(String entity, String id);
-
-    default boolean isInitialized() {
-        return true;
-    }
+    boolean deleteById(String entity, String id);
 
     @Override
     void close();

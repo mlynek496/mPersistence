@@ -1,31 +1,52 @@
 package pl.persistence;
 
 import java.lang.reflect.Field;
-import java.util.Objects;
+import java.lang.reflect.Modifier;
 
-public record EntityMetadata(String name, Field id) {
+final class EntityMetadata {
 
-    public EntityMetadata(String name, Field id) {
-        this.name = Objects.requireNonNull(name, "name");
-        this.id = Objects.requireNonNull(id, "id");
-        if (!id.trySetAccessible()) {
-            throw new IllegalStateException("Cannot access @Id field: " + id);
+    private final Class<?> type;
+    private final String name;
+    private final Field idField;
+
+    EntityMetadata(Class<?> type, String name, Field idField) {
+        this.type = type;
+        this.name = name;
+        this.idField = idField;
+        if (!this.idField.trySetAccessible()) {
+            throw new PersistenceException("Cannot access @Id field: " + this.idField);
         }
     }
 
-    public Object readId(Object instance) {
+    Class<?> type() {
+        return this.type;
+    }
+
+    String name() {
+        return this.name;
+    }
+
+    Field id() {
+        return this.idField;
+    }
+
+    Object readId(Object instance) {
         try {
-            return this.id.get(instance);
+            return this.idField.get(instance);
         } catch (IllegalAccessException exception) {
-            throw new IllegalStateException("Cannot read @Id field: " + this.id, exception);
+            throw new PersistenceException("Cannot read @Id field of " + this.type.getName(), exception);
         }
     }
 
-    public void writeId(Object instance, Object value) {
+    void writeId(Object instance, Object value) {
+        if (Modifier.isFinal(this.idField.getModifiers())) {
+            throw new PersistenceException("@Id field cannot be final: " + this.idField);
+        }
+
         try {
-            this.id.set(instance, value);
+            this.idField.set(instance, value);
         } catch (IllegalAccessException exception) {
-            throw new IllegalStateException("Cannot write @Id field: " + this.id, exception);
+            throw new PersistenceException("Cannot write @Id field of " + this.type.getName(), exception);
         }
     }
 }

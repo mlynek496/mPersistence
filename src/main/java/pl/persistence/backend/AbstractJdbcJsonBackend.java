@@ -2,7 +2,13 @@ package pl.persistence.backend;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-import pl.persistence.query.*;
+import pl.persistence.PersistenceException;
+import pl.persistence.query.Filter;
+import pl.persistence.query.Operator;
+import pl.persistence.query.QuerySpec;
+import pl.persistence.query.Sort;
+import pl.persistence.query.SortDirection;
+import pl.persistence.query.SortValueType;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
@@ -11,15 +17,21 @@ import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 abstract class AbstractJdbcJsonBackend implements StorageBackend {
 
+    private static final String IDENTIFIER_PATTERN = "[A-Za-z_][A-Za-z0-9_]*";
+
+    private final Set<String> initializedEntities = ConcurrentHashMap.newKeySet();
     private volatile HikariDataSource dataSource;
 
     protected abstract String jdbcUrl();
 
     protected abstract String createTableSql(String entity);
+
+    protected abstract String upsertSql(String entity);
 
     protected abstract String jsonValueExpression(String field, SortValueType valueType);
 
@@ -33,52 +45,62 @@ abstract class AbstractJdbcJsonBackend implements StorageBackend {
 
     protected abstract void configure(HikariConfig config);
 
-    protected final void initializeDataSource() {
-        if (dataSource != null) {
+    @Override
+    public synchronized void initialize() {
+        if (this.dataSource != null) {
             return;
         }
-
         HikariConfig config = new HikariConfig();
-        config.setJdbcUrl(jdbcUrl());
-        configure(config);
-        dataSource = new HikariDataSource(config);
+        config.setJdbcUrl(this.jdbcUrl());
+        config.setConnectionTimeout(5000L);
+        config.setValidationTimeout(2500L);
+        this.configure(config);
+        this.dataSource = new HikariDataSource(config);
     }
 
     @Override
-    public final void initialize() {
-        initializeDataSource();
-    }
-
-    @Override
-    public boolean isInitialized() {
-        return dataSource != null;
-    }
-
-    @Override
-    public void ensureEntity(String entity) {
-        validateIdentifier(entity);
-        try (Connection connection = connection();
-             PreparedStatement statement = connection.prepareStatement(createTableSql(entity))) {
-            statement.executeUpdate();
-        } catch (Exception exception) {
-            throw new IllegalStateException("Failed to initialize entity " + entity, exception);
+    public final void ensureEntity(String entity) {
+        this.validateIdentifier(entity);
+        this.requireDataSource();
+        if (this.initializedEntities.contains(entity)) {
+            return;
+        }
+        synchronized (this.initializedEntities) {
+            if (this.initializedEntities.contains(entity)) {
+                return;
+            }
+            try (Connection connection = this.connection(); PreparedStatement statement = connection.prepareStatement(this.createTableSql(entity))) {
+                statement.executeUpdate();
+                this.initializedEntities.add(entity);
+            } catch (Exception exception) {
+                throw new PersistenceException("Failed to initialize entity " + entity, exception);
+            }
         }
     }
 
     @Override
-    public List<StoredEntity> find(String entity, QuerySpec spec) {
-        ensureEntity(entity);
-        StringBuilder sql = new StringBuilder("SELECT `id`, `data` FROM ").append(quote(entity));
+    public List<StoredEntity> find(String entity, QuerySpec query) {
+        this.ensureEntity(entity);
+        StringBuilder sql = new StringBuilder("SELECT `id`, `data` FROM ").append(this.quote(entity));
         List<Object> parameters = new ArrayList<>();
-        appendWhere(sql, parameters, spec.filters());
-        appendOrderBy(sql, spec.sorts());
-        sql.append(" LIMIT ? OFFSET ?");
-        parameters.add(spec.limit() > 0 ? spec.limit() : Long.MAX_VALUE);
-        parameters.add(spec.offset());
+        this.appendWhere(sql, parameters, query.filters());
+        this.appendOrderBy(sql, query.sorts());
+        if (query.limit() > 0) {
+            sql.append(" LIMIT ?");
+            parameters.add(query.limit());
+            if (query.offset() > 0) {
+                sql.append(" OFFSET ?");
+                parameters.add(query.offset());
+            }
+        } else if (query.offset() > 0) {
+            sql.append(" LIMIT ? OFFSET ?");
+            parameters.add(Long.MAX_VALUE);
+            parameters.add(query.offset());
+        }
+
         List<StoredEntity> result = new ArrayList<>();
-        try (Connection connection = connection();
-             PreparedStatement statement = connection.prepareStatement(sql.toString())) {
-            bind(statement, parameters);
+        try (Connection connection = this.connection(); PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            this.bind(statement, parameters);
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next()) {
                     result.add(new StoredEntity(entity, resultSet.getString("id"), resultSet.getString("data")));
@@ -86,85 +108,112 @@ abstract class AbstractJdbcJsonBackend implements StorageBackend {
             }
             return result;
         } catch (Exception exception) {
-            throw new IllegalStateException("Failed to query entity " + entity, exception);
+            throw new PersistenceException("Failed to query entity " + entity, exception);
         }
     }
 
     @Override
-    public long count(String entity, QuerySpec spec) {
-        ensureEntity(entity);
-        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM ").append(quote(entity));
+    public long count(String entity, QuerySpec query) {
+        this.ensureEntity(entity);
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM ").append(this.quote(entity));
         List<Object> parameters = new ArrayList<>();
-        appendWhere(sql, parameters, spec.filters());
-        try (Connection connection = connection();
-             PreparedStatement statement = connection.prepareStatement(sql.toString())) {
-            bind(statement, parameters);
+        this.appendWhere(sql, parameters, query.filters());
+        try (Connection connection = this.connection(); PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            this.bind(statement, parameters);
             try (ResultSet resultSet = statement.executeQuery()) {
                 resultSet.next();
                 return resultSet.getLong(1);
             }
         } catch (Exception exception) {
-            throw new IllegalStateException("Failed to count entity " + entity, exception);
+            throw new PersistenceException("Failed to count entity " + entity, exception);
         }
     }
 
     @Override
-    public long delete(String entity, QuerySpec spec) {
-        ensureEntity(entity);
-        StringBuilder sql = new StringBuilder("DELETE FROM ").append(quote(entity));
+    public long delete(String entity, QuerySpec query) {
+        this.ensureEntity(entity);
+        StringBuilder sql = new StringBuilder("DELETE FROM ").append(this.quote(entity));
         List<Object> parameters = new ArrayList<>();
-        appendWhere(sql, parameters, spec.filters());
-        try (Connection connection = connection();
-             PreparedStatement statement = connection.prepareStatement(sql.toString())) {
-            bind(statement, parameters);
+        this.appendWhere(sql, parameters, query.filters());
+        try (Connection connection = this.connection(); PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            this.bind(statement, parameters);
             return statement.executeUpdate();
         } catch (Exception exception) {
-            throw new IllegalStateException("Failed to delete from entity " + entity, exception);
-        }
-    }
-
-    @Override
-    public void deleteById(String entity, String id) {
-        ensureEntity(entity);
-        String sql = "DELETE FROM " + quote(entity) + " WHERE `id` = ?";
-        try (Connection connection = connection();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
-            statement.setString(1, id);
-            statement.executeUpdate();
-        } catch (Exception exception) {
-            throw new IllegalStateException("Failed to delete " + entity + ":" + id, exception);
+            throw new PersistenceException("Failed to delete from entity " + entity, exception);
         }
     }
 
     @Override
     public void save(StoredEntity entity) {
-        ensureEntity(entity.entity());
-        String sql = upsertSql(entity.entity());
-        try (Connection connection = connection();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
+        this.ensureEntity(entity.entity());
+        try (Connection connection = this.connection(); PreparedStatement statement = connection.prepareStatement(this.upsertSql(entity.entity()))) {
             statement.setString(1, entity.id());
             statement.setString(2, entity.json());
             statement.executeUpdate();
         } catch (Exception exception) {
-            throw new IllegalStateException("Failed to save " + entity.entity() + ":" + entity.id(), exception);
+            throw new PersistenceException("Failed to save " + entity.entity() + ":" + entity.id(), exception);
         }
     }
 
     @Override
-    public void close() {
-        if (this.dataSource != null) {
-            this.dataSource.close();
+    public boolean deleteById(String entity, String id) {
+        this.ensureEntity(entity);
+        String sql = "DELETE FROM " + this.quote(entity) + " WHERE `id` = ?";
+        try (Connection connection = this.connection(); PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, id);
+            return statement.executeUpdate() > 0;
+        } catch (Exception exception) {
+            throw new PersistenceException("Failed to delete " + entity + ":" + id, exception);
         }
     }
 
-    protected abstract String upsertSql(String entity);
+    @Override
+    public synchronized void close() {
+        HikariDataSource current = this.dataSource;
+        this.dataSource = null;
+        this.initializedEntities.clear();
+        if (current != null) {
+            current.close();
+        }
+    }
 
     protected final Connection connection() throws Exception {
-        HikariDataSource current = dataSource;
+        HikariDataSource current = this.dataSource;
         if (current == null) {
             throw new IllegalStateException("Backend is not initialized");
         }
         return current.getConnection();
+    }
+
+    protected final Object normalizeSqlValue(Object value) {
+        if (value instanceof java.util.UUID uuid) {
+            return uuid.toString();
+        }
+        if (value instanceof Enum<?> enumeration) {
+            return enumeration.name();
+        }
+        if (value instanceof BigDecimal decimal) {
+            return decimal;
+        }
+        return value;
+    }
+
+    protected final String quote(String identifier) {
+        this.validateIdentifier(identifier);
+        return "`" + identifier + "`";
+    }
+
+    protected final String jsonPath(String field) {
+        if (!field.matches(IDENTIFIER_PATTERN + "(?:\\." + IDENTIFIER_PATTERN + ")*")) {
+            throw new IllegalArgumentException("Invalid query field: " + field);
+        }
+        return "$." + field;
+    }
+
+    private void requireDataSource() {
+        if (this.dataSource == null) {
+            throw new IllegalStateException("Backend is not initialized");
+        }
     }
 
     private void appendWhere(StringBuilder sql, List<Object> parameters, List<Filter> filters) {
@@ -178,23 +227,21 @@ abstract class AbstractJdbcJsonBackend implements StorageBackend {
             }
             Filter filter = filters.get(i);
             String field = filter.field();
-            String expression = jsonValueExpression(field, inferValueType(filter));
+            String expression = "_id".equals(field) ? "`id`" : this.jsonValueExpression(field, this.inferValueType(filter));
             switch (filter.operator()) {
-                case EXISTS -> sql.append(field.equals("_id") ? "`id` IS NOT NULL" : jsonExistsExpression(field));
-                case IS_NULL -> sql.append(field.equals("_id") ? "`id` IS NULL" : jsonIsNullExpression(field));
-                case IS_NOT_NULL ->
-                        sql.append(field.equals("_id") ? "`id` IS NOT NULL" : jsonIsNotNullExpression(field));
+                case EXISTS -> sql.append("_id".equals(field) ? "`id` IS NOT NULL" : this.jsonExistsExpression(field));
+                case IS_NULL -> sql.append("_id".equals(field) ? "`id` IS NULL" : this.jsonIsNullExpression(field));
+                case IS_NOT_NULL -> sql.append("_id".equals(field) ? "`id` IS NOT NULL" : this.jsonIsNotNullExpression(field));
                 case IN -> {
-                    Collection<?> values = requireCollection(filter.value());
+                    Collection<?> values = this.requireCollection(filter.value());
                     sql.append(expression).append(" IN (");
-                    appendPlaceholders(sql, values.size());
+                    this.appendPlaceholders(sql, values.size());
                     sql.append(')');
-                    values.forEach(value -> parameters.add(sqlValue(value)));
+                    values.forEach(value -> parameters.add(this.sqlValue(value)));
                 }
-                case EQUAL, NOT_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL,
-                     LESS_THAN, LESS_THAN_OR_EQUAL -> {
-                    sql.append(expression).append(' ').append(operatorSql(filter.operator())).append(" ?");
-                    parameters.add(sqlValue(filter.value()));
+                case EQUAL, NOT_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL -> {
+                    sql.append(expression).append(' ').append(this.operatorSql(filter.operator())).append(" ?");
+                    parameters.add(this.sqlValue(filter.value()));
                 }
             }
         }
@@ -210,7 +257,8 @@ abstract class AbstractJdbcJsonBackend implements StorageBackend {
                 sql.append(", ");
             }
             Sort sort = sorts.get(i);
-            sql.append(jsonValueExpression(sort.field(), sort.valueType())).append(sort.direction() == SortDirection.ASCENDING ? " ASC" : " DESC");
+            sql.append("_id".equals(sort.field()) ? "`id`" : this.jsonValueExpression(sort.field(), sort.valueType()));
+            sql.append(sort.direction() == SortDirection.ASCENDING ? " ASC" : " DESC");
         }
     }
 
@@ -261,40 +309,9 @@ abstract class AbstractJdbcJsonBackend implements StorageBackend {
         }
     }
 
-    protected final Object normalizeSqlValue(Object value) {
-        if (value instanceof java.util.UUID uuid) {
-            return uuid.toString();
-        }
-        if (value instanceof Enum<?> enumeration) {
-            return enumeration.name();
-        }
-        if (value instanceof Boolean bool) {
-            return bool;
-        }
-        if (value instanceof BigDecimal decimal) {
-            return decimal;
-        }
-        return Objects.requireNonNull(value, "SQL value cannot be null");
-    }
-
-    protected final String quote(String identifier) {
-        validateIdentifier(identifier);
-        return "`" + identifier + "`";
-    }
-
-    protected final void validateIdentifier(String identifier) {
-        if (identifier == null || !identifier.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+    private void validateIdentifier(String identifier) {
+        if (identifier == null || !identifier.matches(IDENTIFIER_PATTERN)) {
             throw new IllegalArgumentException("Invalid identifier: " + identifier);
         }
-    }
-
-    protected final String jsonPath(String field) {
-        if ("_id".equals(field)) {
-            throw new IllegalArgumentException("_id has no JSON path");
-        }
-        if (!field.matches("[A-Za-z_][A-Za-z0-9_.]*")) {
-            throw new IllegalArgumentException("Invalid query field: " + field);
-        }
-        return "$." + field;
     }
 }

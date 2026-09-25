@@ -1,16 +1,19 @@
 package pl.persistence.backend;
 
+import com.mongodb.MongoException;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.Sorts;
 import org.bson.Document;
 import org.bson.conversions.Bson;
-import com.mongodb.client.model.Filters;
+import pl.persistence.PersistenceException;
 import pl.persistence.query.Filter;
+import pl.persistence.query.Operator;
 import pl.persistence.query.QuerySpec;
 import pl.persistence.query.Sort;
 import pl.persistence.query.SortDirection;
@@ -18,62 +21,71 @@ import pl.persistence.query.SortDirection;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import java.util.Objects;
 import java.util.UUID;
 
 public final class MongoBackend implements StorageBackend {
+
     private final String connectionString;
     private final String databaseName;
+
     private volatile MongoClient client;
     private volatile MongoDatabase database;
 
     public MongoBackend(String connectionString, String databaseName) {
-        this.connectionString = Objects.requireNonNull(connectionString, "connectionString");
-        this.databaseName = Objects.requireNonNull(databaseName, "databaseName");
-        if (databaseName.isBlank()) {
-            throw new IllegalArgumentException("Database name cannot be blank");
+        if (connectionString == null || connectionString.isBlank()) {
+            throw new IllegalArgumentException("MongoDB connection string cannot be blank");
         }
+        if (databaseName == null || databaseName.isBlank()) {
+            throw new IllegalArgumentException("MongoDB database name cannot be blank");
+        }
+        this.connectionString = connectionString;
+        this.databaseName = databaseName;
     }
 
     @Override
     public synchronized void initialize() {
-        if (client != null) {
+        if (this.client != null) {
             return;
         }
-        client = MongoClients.create(connectionString);
-        database = client.getDatabase(databaseName);
-    }
-
-    @Override
-    public boolean isInitialized() {
-        return client != null;
+        MongoClient created = null;
+        try {
+            created = MongoClients.create(this.connectionString);
+            MongoDatabase selectedDatabase = created.getDatabase(this.databaseName);
+            selectedDatabase.runCommand(new Document("ping", 1));
+            this.client = created;
+            this.database = selectedDatabase;
+        } catch (MongoException exception) {
+            if (created != null) {
+                created.close();
+            }
+            throw new PersistenceException("Could not initialize MongoDB", exception);
+        }
     }
 
     @Override
     public void ensureEntity(String entity) {
-        validateEntity(entity);
+        this.validateEntity(entity);
+        this.ensureInitialized();
     }
 
     @Override
-    public List<StoredEntity> find(String entity, QuerySpec spec) {
-        FindIterable<Document> query = collection(entity).find(toQuery(spec.filters()));
-
-        List<Bson> sorts = toSorts(spec.sorts());
+    public List<StoredEntity> find(String entity, QuerySpec query) {
+        MongoCollection<Document> collection = this.collection(entity);
+        FindIterable<Document> iterable = collection.find(this.toQuery(query.filters()));
+        List<Bson> sorts = this.toSorts(query.sorts());
         if (!sorts.isEmpty()) {
-            query = query.sort(Sorts.orderBy(sorts));
+            iterable = iterable.sort(Sorts.orderBy(sorts));
         }
-
-        if (spec.offset() > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("Offset is too large for MongoDB: " + spec.offset());
+        if (query.offset() > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("MongoDB offset is too large: " + query.offset());
         }
-
-        query.skip((int) spec.offset());
-        if (spec.limit() > 0) {
-            query.limit(spec.limit());
+        iterable = iterable.skip((int) query.offset());
+        if (query.limit() > 0) {
+            iterable = iterable.limit(query.limit());
         }
 
         List<StoredEntity> result = new ArrayList<>();
-        for (Document document : query) {
+        for (Document document : iterable) {
             String id = document.getString("_id");
             document.remove("_id");
             result.add(new StoredEntity(entity, id, document.toJson()));
@@ -82,41 +94,38 @@ public final class MongoBackend implements StorageBackend {
     }
 
     @Override
-    public long count(String entity, QuerySpec spec) {
-        return collection(entity).countDocuments(toQuery(spec.filters()));
+    public long count(String entity, QuerySpec query) {
+        return this.collection(entity).countDocuments(this.toQuery(query.filters()));
     }
 
     @Override
-    public long delete(String entity, QuerySpec spec) {
-        return collection(entity).deleteMany(toQuery(spec.filters())).getDeletedCount();
+    public long delete(String entity, QuerySpec query) {
+        return this.collection(entity).deleteMany(this.toQuery(query.filters())).getDeletedCount();
     }
 
     @Override
     public void save(StoredEntity entity) {
         Document document = Document.parse(entity.json());
         document.put("_id", entity.id());
-
-        collection(entity.entity()).replaceOne(
-                Filters.eq("_id", entity.id()),
-                document,
-                new ReplaceOptions().upsert(true)
-        );
+        this.collection(entity.entity()).replaceOne(Filters.eq("_id", entity.id()), document, new ReplaceOptions().upsert(true));
     }
 
     @Override
-    public void deleteById(String entity, String id) {
-        collection(entity).deleteOne(Filters.eq("_id", id));
+    public boolean deleteById(String entity, String id) {
+        return this.collection(entity).deleteOne(Filters.eq("_id", id)).getDeletedCount() > 0;
     }
 
     @Override
-    public void close() {
-        if (this.client != null) {
-            this.client.close();
+    public synchronized void close() {
+        MongoClient current = this.client;
+        this.client = null;
+        this.database = null;
+        if (current != null) {
+            current.close();
         }
     }
 
     private MongoCollection<Document> collection(String entity) {
-        this.ensureInitialized();
         this.ensureEntity(entity);
         return this.database.getCollection(entity);
     }
@@ -127,22 +136,22 @@ public final class MongoBackend implements StorageBackend {
         }
         List<Bson> predicates = new ArrayList<>(filters.size());
         for (Filter filter : filters) {
-            predicates.add(toBson(filter));
+            predicates.add(this.toBson(filter));
         }
         return Filters.and(predicates);
     }
 
     private Bson toBson(Filter filter) {
-        String field = "_id".equals(filter.field()) ? "_id" : filter.field();
+        String field = filter.field();
         Object value = filter.value();
         return switch (filter.operator()) {
-            case EQUAL -> Filters.eq(field, mongoValue(value));
-            case NOT_EQUAL -> Filters.ne(field, mongoValue(value));
-            case GREATER_THAN -> Filters.gt(field, mongoValue(value));
-            case GREATER_THAN_OR_EQUAL -> Filters.gte(field, mongoValue(value));
-            case LESS_THAN -> Filters.lt(field, mongoValue(value));
-            case LESS_THAN_OR_EQUAL -> Filters.lte(field, mongoValue(value));
-            case IN -> Filters.in(field, mongoValues(value));
+            case EQUAL -> Filters.eq(field, this.mongoValue(value));
+            case NOT_EQUAL -> Filters.ne(field, this.mongoValue(value));
+            case GREATER_THAN -> Filters.gt(field, this.mongoValue(value));
+            case GREATER_THAN_OR_EQUAL -> Filters.gte(field, this.mongoValue(value));
+            case LESS_THAN -> Filters.lt(field, this.mongoValue(value));
+            case LESS_THAN_OR_EQUAL -> Filters.lte(field, this.mongoValue(value));
+            case IN -> Filters.in(field, this.mongoValues(value));
             case EXISTS -> Filters.exists(field, true);
             case IS_NULL -> Filters.and(Filters.exists(field, true), Filters.eq(field, null));
             case IS_NOT_NULL -> Filters.and(Filters.exists(field, true), Filters.ne(field, null));
@@ -152,9 +161,8 @@ public final class MongoBackend implements StorageBackend {
     private List<Bson> toSorts(List<Sort> sorts) {
         List<Bson> result = new ArrayList<>(sorts.size());
         for (Sort sort : sorts) {
-            String field = "_id".equals(sort.field()) ? "_id" : sort.field();
             int direction = sort.direction() == SortDirection.ASCENDING ? 1 : -1;
-            result.add(direction > 0 ? Sorts.ascending(field) : Sorts.descending(field));
+            result.add(direction > 0 ? Sorts.ascending(sort.field()) : Sorts.descending(sort.field()));
         }
         return result;
     }
@@ -173,7 +181,14 @@ public final class MongoBackend implements StorageBackend {
         if (!(value instanceof Collection<?> values) || values.isEmpty()) {
             throw new IllegalArgumentException("IN filter requires a non-empty collection");
         }
-        return values.stream().map(this::mongoValue).toList();
+        List<Object> result = new ArrayList<>(values.size());
+        for (Object entry : values) {
+            if (entry == null) {
+                throw new IllegalArgumentException("IN filter does not support null values");
+            }
+            result.add(this.mongoValue(entry));
+        }
+        return result;
     }
 
     private void validateEntity(String entity) {
