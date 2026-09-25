@@ -6,20 +6,21 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 public final class Repository<T> {
-
     private final Database database;
     private final Class<T> type;
 
-    Repository(Database database, Class<T> type) {
+    public Repository(Database database, Class<T> type) {
         this.database = database;
         this.type = type;
     }
-
     public CompletableFuture<T> save(T entity) {
         return this.database.submit(() -> this.database.saveInternal(entity));
     }
 
     public CompletableFuture<List<T>> saveAll(Collection<T> entities) {
+        if (entities == null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("Entities cannot be null"));
+        }
         List<T> snapshot = List.copyOf(entities);
         return this.database.submit(() -> this.database.saveAllInternal(snapshot));
     }

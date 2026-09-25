@@ -4,15 +4,11 @@ import com.zaxxer.hikari.HikariConfig;
 import pl.persistence.query.SortValueType;
 
 import java.math.BigDecimal;
+import java.util.List;
 
-public final class MySQLBackend extends AbstractJdbcJsonBackend {
+public final class MySQLBackend implements StorageBackend {
 
-    private final String host;
-    private final int port;
-    private final String database;
-    private final String username;
-    private final String password;
-    private final int poolSize;
+    private final JdbcBackend backend;
 
     public MySQLBackend(String host, int port, String database, String username, String password) {
         this(host, port, database, username, password, 10);
@@ -34,71 +30,115 @@ public final class MySQLBackend extends AbstractJdbcJsonBackend {
         if (poolSize < 1) {
             throw new IllegalArgumentException("MySQL pool size must be greater than zero");
         }
-        this.host = host;
-        this.port = port;
-        this.database = database;
-        this.username = username;
-        this.password = password == null ? "" : password;
-        this.poolSize = poolSize;
+
+        this.backend = new JdbcBackend(new Dialect(host, port, database, username, password, poolSize));
     }
 
     @Override
-    protected String jdbcUrl() {
-        return "jdbc:mysql://" + this.host + ":" + this.port + "/" + this.database + "?useSSL=false&characterEncoding=utf8&serverTimezone=UTC";
+    public void initialize() {
+        this.backend.initialize();
     }
 
     @Override
-    protected void configure(HikariConfig config) {
-        config.setPoolName("mPersistence-MySQL");
-        config.setMaximumPoolSize(this.poolSize);
-        config.setMinimumIdle(Math.min(2, this.poolSize));
-        config.setUsername(this.username);
-        config.setPassword(this.password);
+    public void ensureEntity(String entity) {
+        this.backend.ensureEntity(entity);
     }
 
     @Override
-    protected String createTableSql(String entity) {
-        return "CREATE TABLE IF NOT EXISTS %s (`id` VARCHAR(255) NOT NULL PRIMARY KEY, `data` JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci".formatted(this.quote(entity));
+    public List<StoredEntity> find(String entity, pl.persistence.query.QuerySpec query) {
+        return this.backend.find(entity, query);
     }
 
     @Override
-    protected String upsertSql(String entity) {
-        return "INSERT INTO %s (`id`, `data`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `data` = VALUES(`data`)".formatted(this.quote(entity));
+    public long count(String entity, pl.persistence.query.QuerySpec query) {
+        return this.backend.count(entity, query);
     }
 
     @Override
-    protected String jsonValueExpression(String field, SortValueType valueType) {
-        String expression = "JSON_UNQUOTE(JSON_EXTRACT(`data`, '" + this.jsonPath(field) + "'))";
-        return switch (valueType) {
-            case RAW, STRING -> expression;
-            case NUMBER -> "CAST(" + expression + " AS DECIMAL(65,20))";
-        };
+    public long delete(String entity, pl.persistence.query.QuerySpec query) {
+        return this.backend.delete(entity, query);
     }
 
     @Override
-    protected String jsonExistsExpression(String field) {
-        return "JSON_CONTAINS_PATH(`data`, 'one', '" + this.jsonPath(field) + "')";
+    public void save(StoredEntity entity) {
+        this.backend.save(entity);
     }
 
     @Override
-    protected String jsonIsNullExpression(String field) {
-        return "JSON_CONTAINS_PATH(`data`, 'one', '" + this.jsonPath(field) + "') AND JSON_TYPE(JSON_EXTRACT(`data`, '" + this.jsonPath(field) + "')) = 'NULL'";
+    public boolean deleteById(String entity, String id) {
+        return this.backend.deleteById(entity, id);
     }
 
     @Override
-    protected String jsonIsNotNullExpression(String field) {
-        return "JSON_CONTAINS_PATH(`data`, 'one', '" + this.jsonPath(field) + "') AND JSON_TYPE(JSON_EXTRACT(`data`, '" + this.jsonPath(field) + "')) <> 'NULL'";
+    public void close() {
+        this.backend.close();
     }
 
-    @Override
-    protected Object sqlValue(Object value) {
-        Object normalized = this.normalizeSqlValue(value);
-        if (normalized instanceof Boolean bool) {
-            return bool ? "true" : "false";
+    private record Dialect(String host, int port, String database, String username, String password, int poolSize) implements JdbcDialect {
+
+        @Override
+        public String jdbcUrl() {
+            return "jdbc:mysql://" + this.host + ":" + this.port + "/" + this.database + "?useSSL=false&characterEncoding=utf8&serverTimezone=UTC";
         }
-        if (normalized instanceof BigDecimal decimal) {
-            return decimal;
+
+        @Override
+        public void configure(HikariConfig config) {
+            config.setPoolName("mPersistence-MySQL");
+            config.setMaximumPoolSize(this.poolSize);
+            config.setMinimumIdle(Math.min(2, this.poolSize));
+            config.setUsername(this.username);
+            config.setPassword(this.password == null ? "" : this.password);
         }
-        return normalized;
+
+        @Override
+        public String createTableSql(String entity) {
+            return "CREATE TABLE IF NOT EXISTS `" + entity + "` (`id` VARCHAR(255) NOT NULL PRIMARY KEY, `data` JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        }
+
+        @Override
+        public String upsertSql(String entity) {
+            return "INSERT INTO `" + entity + "` (`id`, `data`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `data` = VALUES(`data`)";
+        }
+
+        @Override
+        public String jsonValueExpression(String field, SortValueType valueType) {
+            String expression = "JSON_UNQUOTE(JSON_EXTRACT(`data`, '$." + field + "'))";
+            return switch (valueType) {
+                case RAW, STRING -> expression;
+                case NUMBER -> "CAST(" + expression + " AS DECIMAL(65,20))";
+            };
+        }
+
+        @Override
+        public String jsonExistsExpression(String field) {
+            return "JSON_CONTAINS_PATH(`data`, 'one', '$." + field + "')";
+        }
+
+        @Override
+        public String jsonIsNullExpression(String field) {
+            return "JSON_CONTAINS_PATH(`data`, 'one', '$." + field + "') AND JSON_TYPE(JSON_EXTRACT(`data`, '$." + field + "')) = 'NULL'";
+        }
+
+        @Override
+        public String jsonIsNotNullExpression(String field) {
+            return "JSON_CONTAINS_PATH(`data`, 'one', '$." + field + "') AND JSON_TYPE(JSON_EXTRACT(`data`, '$." + field + "')) <> 'NULL'";
+        }
+
+        @Override
+        public Object sqlValue(Object value) {
+            if (value instanceof java.util.UUID uuid) {
+                return uuid.toString();
+            }
+            if (value instanceof Enum<?> enumeration) {
+                return enumeration.name();
+            }
+            if (value instanceof Boolean bool) {
+                return bool ? "true" : "false";
+            }
+            if (value instanceof BigDecimal decimal) {
+                return decimal;
+            }
+            return value;
+        }
     }
 }

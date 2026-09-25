@@ -7,19 +7,16 @@ import pl.persistence.backend.SQLiteBackend;
 import pl.persistence.backend.StorageBackend;
 import pl.persistence.backend.StoredEntity;
 import pl.persistence.query.QuerySpec;
-
 import java.io.File;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class Database implements AutoCloseable {
@@ -27,30 +24,28 @@ public final class Database implements AutoCloseable {
     private final JsonMapper mapper;
     private final MetadataRegistry metadataRegistry;
     private final ExecutorService executor;
-    private final Duration shutdownTimeout;
+    private final CompletableFuture<Void> initialization;
     private final AtomicBoolean closed = new AtomicBoolean();
-    private final AtomicBoolean initialized = new AtomicBoolean();
-    private final Object initializationLock = new Object();
 
-    private Database(StorageBackend backend, JsonMapper mapper, Duration shutdownTimeout) {
-        if (backend == null) {
-            throw new IllegalArgumentException("Backend cannot be null");
-        }
-        if (mapper == null) {
-            throw new IllegalArgumentException("JsonMapper cannot be null");
-        }
-        if (shutdownTimeout == null || shutdownTimeout.isNegative() || shutdownTimeout.isZero()) {
-            throw new IllegalArgumentException("Shutdown timeout must be positive");
-        }
+
+    private Database(StorageBackend backend, JsonMapper mapper) {
         this.backend = backend;
         this.mapper = mapper;
         this.metadataRegistry = new MetadataRegistry();
-        this.shutdownTimeout = shutdownTimeout;
-        this.executor = Executors.newVirtualThreadPerTaskExecutor();
+        this.executor = Executors.newSingleThreadExecutor();
+        this.initialization = CompletableFuture.runAsync(this.backend::initialize, this.executor);
+    }
+
+    public static Database flat(File file) {
+        return Database.sqlite(file);
+    }
+
+    public static Database flat(Path file) {
+        return Database.flat(file.toFile());
     }
 
     public static Database sqlite(File file) {
-        return new Database(new SQLiteBackend(file), defaultMapper(), Duration.ofSeconds(5));
+        return new Database(new SQLiteBackend(file), Database.defaultMapper());
     }
 
     public static Database sqlite(Path file) {
@@ -58,19 +53,19 @@ public final class Database implements AutoCloseable {
     }
 
     public static Database mysql(String host, int port, String database, String username, String password) {
-        return Database.mysql(host, port, database, username, password, 10);
+        return new Database(new MySQLBackend(host, port, database, username, password), Database.defaultMapper());
     }
 
-    public static Database mysql(String host, int port, String database, String username, String password, int poolSize) {
-        return new Database(new MySQLBackend(host, port, database, username, password, poolSize), defaultMapper(), Duration.ofSeconds(5));
+    public static Database mongodb(String host, int port, String database, String username, String password) {
+        return new Database(new MongoBackend(host, port, database, username, password), Database.defaultMapper());
     }
 
     public static Database mongodb(String connectionString, String database) {
-        return new Database(new MongoBackend(connectionString, database), defaultMapper(), Duration.ofSeconds(5));
+        return new Database(new MongoBackend(connectionString, database), Database.defaultMapper());
     }
 
     public static Database custom(StorageBackend backend) {
-        return new Database(backend, defaultMapper(), Duration.ofSeconds(5));
+        return new Database(backend, Database.defaultMapper());
     }
 
     public <T> Repository<T> repository(Class<T> type) {
@@ -83,22 +78,27 @@ public final class Database implements AutoCloseable {
         return this.closed.get();
     }
 
-    <T> CompletableFuture<T> submit(ThrowingSupplier<T> supplier) {
+    <T> CompletableFuture<T> submit(Task<T> task) {
         this.ensureOpen();
-        try {
-            return CompletableFuture.supplyAsync(() -> {
-                this.ensureInitialized();
-                try {
-                    return supplier.get();
-                } catch (PersistenceException exception) {
-                    throw exception;
-                } catch (Exception exception) {
-                    throw new PersistenceException("Database operation failed", exception);
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                this.initialization.get();
+                return task.execute();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new PersistenceException("Database operation interrupted", exception);
+            } catch (java.util.concurrent.ExecutionException exception) {
+                Throwable cause = exception.getCause();
+                if (cause instanceof PersistenceException persistenceException) {
+                    throw persistenceException;
                 }
-            }, this.executor);
-        } catch (RejectedExecutionException exception) {
-            return CompletableFuture.failedFuture(new PersistenceException("Database is closing", exception));
-        }
+                throw new PersistenceException("Database initialization failed", cause);
+            } catch (PersistenceException exception) {
+                throw exception;
+            } catch (Exception exception) {
+                throw new PersistenceException("Database operation failed", exception);
+            }
+        }, this.executor);
     }
 
     <T> T saveInternal(T entity) {
@@ -114,7 +114,7 @@ public final class Database implements AutoCloseable {
             id = UUID.randomUUID();
             metadata.writeId(entity, id);
         }
-        this.backend.save(new StoredEntity(metadata.name(), this.stringifyId(id), this.mapper.write(entity)));
+        this.backend.save(new StoredEntity(metadata.name(), Database.stringifyId(id), this.mapper.write(entity)));
         return entity;
     }
 
@@ -122,6 +122,7 @@ public final class Database implements AutoCloseable {
         if (entities == null) {
             throw new IllegalArgumentException("Entities cannot be null");
         }
+
         List<T> result = new ArrayList<>(entities.size());
         for (T entity : entities) {
             result.add(this.saveInternal(entity));
@@ -129,54 +130,57 @@ public final class Database implements AutoCloseable {
         return result;
     }
 
-    <T> java.util.Optional<T> findByIdInternal(Class<T> type, Object id) {
+    <T> Optional<T> findByIdInternal(Class<T> type, Object id) {
         if (id == null) {
             throw new IllegalArgumentException("Id cannot be null");
         }
+
         EntityMetadata metadata = this.metadataRegistry.get(type);
-        List<StoredEntity> stored = this.backend.find(metadata.name(), QuerySpec.byId(this.stringifyId(id)));
+        List<StoredEntity> stored = this.backend.find(metadata.name(), QuerySpec.byId(Database.stringifyId(id)));
         if (stored.isEmpty()) {
-            return java.util.Optional.empty();
+            return Optional.empty();
         }
-        return java.util.Optional.ofNullable(this.mapper.read(stored.get(0).json(), type));
+        return Optional.ofNullable(this.mapper.read(stored.get(0).json(), type));
     }
 
-    <T> List<T> executeInternal(Class<T> type, QuerySpec query) {
+    public <T> List<T> executeInternal(Class<T> type, QuerySpec query) {
         EntityMetadata metadata = this.metadataRegistry.get(type);
         List<StoredEntity> stored = this.backend.find(metadata.name(), query);
         List<T> result = new ArrayList<>(stored.size());
+
         for (StoredEntity entity : stored) {
             T value = this.mapper.read(entity.json(), type);
             if (value != null) {
                 result.add(value);
             }
         }
+
         return result;
     }
 
-    <T> long countInternal(Class<T> type, QuerySpec query) {
+    public <T> long countInternal(Class<T> type, QuerySpec query) {
         return this.backend.count(this.metadataRegistry.get(type).name(), query);
     }
 
-    <T> long deleteByQueryInternal(Class<T> type, QuerySpec query) {
+    public <T> long deleteByQueryInternal(Class<T> type, QuerySpec query) {
         return this.backend.delete(this.metadataRegistry.get(type).name(), query);
     }
 
-    <T> boolean deleteByIdInternal(Class<T> type, Object id) {
+    public <T> boolean deleteByIdInternal(Class<T> type, Object id) {
         if (id == null) {
             throw new IllegalArgumentException("Id cannot be null");
         }
         EntityMetadata metadata = this.metadataRegistry.get(type);
-        return this.backend.deleteById(metadata.name(), this.stringifyId(id));
+        return this.backend.deleteById(metadata.name(), Database.stringifyId(id));
     }
 
-    <T> boolean deleteInternal(T entity) {
+    public <T> boolean deleteInternal(T entity) {
         if (entity == null) {
             throw new IllegalArgumentException("Entity cannot be null");
         }
         EntityMetadata metadata = this.metadataRegistry.get(entity.getClass());
         Object id = metadata.readId(entity);
-        return id != null && this.backend.deleteById(metadata.name(), this.stringifyId(id));
+        return id != null && this.backend.deleteById(metadata.name(), Database.stringifyId(id));
     }
 
     @Override
@@ -184,30 +188,7 @@ public final class Database implements AutoCloseable {
         if (!this.closed.compareAndSet(false, true)) {
             return;
         }
-        this.executor.shutdown();
-        try {
-            if (!this.executor.awaitTermination(this.shutdownTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                this.executor.shutdownNow();
-            }
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            this.executor.shutdownNow();
-        } finally {
-            this.backend.close();
-        }
-    }
-
-    private void ensureInitialized() {
-        if (this.initialized.get()) {
-            return;
-        }
-        synchronized (this.initializationLock) {
-            if (this.initialized.get()) {
-                return;
-            }
-            this.backend.initialize();
-            this.initialized.set(true);
-        }
+        this.backend.close();
     }
 
     private void ensureOpen() {
@@ -216,7 +197,7 @@ public final class Database implements AutoCloseable {
         }
     }
 
-    private String stringifyId(Object id) {
+    private static String stringifyId(Object id) {
         if (id instanceof UUID uuid) {
             return uuid.toString();
         }
@@ -231,8 +212,7 @@ public final class Database implements AutoCloseable {
     }
 
     @FunctionalInterface
-    interface ThrowingSupplier<T> {
-        T get() throws Exception;
+    interface Task<T> {
+        T execute() throws Exception;
     }
-
 }

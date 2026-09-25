@@ -5,7 +5,7 @@ public record Sort(String field, SortDirection direction, SortValueType valueTyp
     private static final String FIELD_PATTERN = "[A-Za-z_][A-Za-z0-9_.]*";
 
     public Sort {
-        if (field == null || !field.matches(FIELD_PATTERN) && !field.equals("_id")) {
+        if (field == null || (!"_id".equals(field) && !field.matches(FIELD_PATTERN))) {
             throw new IllegalArgumentException("Invalid sort field: " + field);
         }
         if (direction == null) {

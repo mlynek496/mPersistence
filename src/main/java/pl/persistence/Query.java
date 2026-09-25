@@ -12,7 +12,6 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 public final class Query<T> {
-
     private final Database database;
     private final Class<T> type;
     private final List<Filter> filters = new ArrayList<>();
@@ -20,7 +19,7 @@ public final class Query<T> {
     private long offset;
     private int limit;
 
-    Query(Database database, Class<T> type) {
+    public Query(Database database, Class<T> type) {
         this.database = database;
         this.type = type;
     }
@@ -58,6 +57,9 @@ public final class Query<T> {
     }
 
     public Query<T> sort(Sort sort) {
+        if (sort == null) {
+            throw new IllegalArgumentException("Sort cannot be null");
+        }
         this.sorts.add(sort);
         return this;
     }
@@ -107,6 +109,9 @@ public final class Query<T> {
     }
 
     Query<T> add(Filter filter) {
+        if (filter == null) {
+            throw new IllegalArgumentException("Filter cannot be null");
+        }
         this.filters.add(filter);
         return this;
     }

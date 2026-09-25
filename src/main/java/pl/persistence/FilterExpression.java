@@ -10,16 +10,19 @@ public final class FilterExpression<T> {
     private final Query<T> query;
     private final String field;
 
-    FilterExpression(Query<T> query, String field) {
+   public FilterExpression(Query<T> query, String field) {
+        if (query == null) {
+            throw new IllegalArgumentException("Query cannot be null");
+        }
+        if (field == null || !field.matches("[A-Za-z_][A-Za-z0-9_.]*")) {
+            throw new IllegalArgumentException("Invalid filter field: " + field);
+        }
         this.query = query;
         this.field = field;
     }
 
     public Query<T> equal(Object value) {
-        if (value == null) {
-            return this.query.add(Filter.isNull(this.field));
-        }
-        return this.query.add(new Filter(this.field, Operator.EQUAL, value));
+        return value == null ? this.query.add(Filter.isNull(this.field)) : this.query.add(new Filter(this.field, Operator.EQUAL, value));
     }
 
     public Query<T> eq(Object value) {
@@ -27,10 +30,7 @@ public final class FilterExpression<T> {
     }
 
     public Query<T> notEqual(Object value) {
-        if (value == null) {
-            return this.query.add(Filter.isNotNull(this.field));
-        }
-        return this.query.add(new Filter(this.field, Operator.NOT_EQUAL, value));
+        return value == null ? this.query.add(Filter.isNotNull(this.field)) : this.query.add(new Filter(this.field, Operator.NOT_EQUAL, value));
     }
 
     public Query<T> ne(Object value) {
@@ -86,7 +86,7 @@ public final class FilterExpression<T> {
     }
 
     public Query<T> between(Object lowerInclusive, Object upperInclusive) {
-        this.gte(lowerInclusive);
-        return this.query.where(this.field).lte(upperInclusive);
+        this.query.add(new Filter(this.field, Operator.GREATER_THAN_OR_EQUAL, lowerInclusive));
+        return this.query.add(new Filter(this.field, Operator.LESS_THAN_OR_EQUAL, upperInclusive));
     }
 }

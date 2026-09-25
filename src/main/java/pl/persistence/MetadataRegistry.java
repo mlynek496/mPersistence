@@ -14,7 +14,7 @@ final class MetadataRegistry {
 
     private final ConcurrentMap<Class<?>, EntityMetadata> cache = new ConcurrentHashMap<>();
 
-    EntityMetadata get(Class<?> type) {
+    public EntityMetadata get(Class<?> type) {
         if (type == null) {
             throw new IllegalArgumentException("Entity type cannot be null");
         }
