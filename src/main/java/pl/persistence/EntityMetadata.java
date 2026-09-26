@@ -3,13 +3,12 @@ package pl.persistence;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 
-final class EntityMetadata {
-
+public final class EntityMetadata {
     private final Class<?> type;
     private final String name;
     private final Field idField;
 
-    EntityMetadata(Class<?> type, String name, Field idField) {
+    public EntityMetadata(Class<?> type, String name, Field idField) {
         this.type = type;
         this.name = name;
         this.idField = idField;
@@ -18,19 +17,15 @@ final class EntityMetadata {
         }
     }
 
-    Class<?> type() {
-        return this.type;
-    }
-
-    String name() {
+    public String name() {
         return this.name;
     }
 
-    Field id() {
-        return this.idField;
+    public Class<?> idType() {
+        return this.idField.getType();
     }
 
-    Object readId(Object instance) {
+    public Object readId(Object instance) {
         try {
             return this.idField.get(instance);
         } catch (IllegalAccessException exception) {
@@ -38,11 +33,10 @@ final class EntityMetadata {
         }
     }
 
-    void writeId(Object instance, Object value) {
+    public void writeId(Object instance, Object value) {
         if (Modifier.isFinal(this.idField.getModifiers())) {
             throw new PersistenceException("@Id field cannot be final: " + this.idField);
         }
-
         try {
             this.idField.set(instance, value);
         } catch (IllegalAccessException exception) {

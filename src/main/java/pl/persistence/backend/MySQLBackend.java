@@ -5,33 +5,13 @@ import pl.persistence.query.SortValueType;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Collection;
 
 public final class MySQLBackend implements StorageBackend {
-
     private final JdbcBackend backend;
 
     public MySQLBackend(String host, int port, String database, String username, String password) {
-        this(host, port, database, username, password, 10);
-    }
-
-    public MySQLBackend(String host, int port, String database, String username, String password, int poolSize) {
-        if (host == null || host.isBlank()) {
-            throw new IllegalArgumentException("MySQL host cannot be blank");
-        }
-        if (port < 1 || port > 65535) {
-            throw new IllegalArgumentException("MySQL port must be between 1 and 65535");
-        }
-        if (database == null || database.isBlank()) {
-            throw new IllegalArgumentException("MySQL database cannot be blank");
-        }
-        if (username == null || username.isBlank()) {
-            throw new IllegalArgumentException("MySQL username cannot be blank");
-        }
-        if (poolSize < 1) {
-            throw new IllegalArgumentException("MySQL pool size must be greater than zero");
-        }
-
-        this.backend = new JdbcBackend(new Dialect(host, port, database, username, password, poolSize));
+        this.backend = new JdbcBackend(new Dialect(host, port, database, username, password));
     }
 
     @Override
@@ -50,6 +30,11 @@ public final class MySQLBackend implements StorageBackend {
     }
 
     @Override
+    public boolean exists(String entity, pl.persistence.query.QuerySpec query) {
+        return this.backend.exists(entity, query);
+    }
+
+    @Override
     public long count(String entity, pl.persistence.query.QuerySpec query) {
         return this.backend.count(entity, query);
     }
@@ -65,6 +50,11 @@ public final class MySQLBackend implements StorageBackend {
     }
 
     @Override
+    public void saveAll(Collection<StoredEntity> entities) {
+        this.backend.saveAll(entities);
+    }
+
+    @Override
     public boolean deleteById(String entity, String id) {
         return this.backend.deleteById(entity, id);
     }
@@ -74,8 +64,8 @@ public final class MySQLBackend implements StorageBackend {
         this.backend.close();
     }
 
-    private record Dialect(String host, int port, String database, String username, String password, int poolSize) implements JdbcDialect {
-
+    private record Dialect(String host, int port, String database, String username,
+                           String password) implements JdbcDialect {
         @Override
         public String jdbcUrl() {
             return "jdbc:mysql://" + this.host + ":" + this.port + "/" + this.database + "?useSSL=false&characterEncoding=utf8&serverTimezone=UTC";
@@ -83,11 +73,10 @@ public final class MySQLBackend implements StorageBackend {
 
         @Override
         public void configure(HikariConfig config) {
-            config.setPoolName("mPersistence-MySQL");
-            config.setMaximumPoolSize(this.poolSize);
-            config.setMinimumIdle(Math.min(2, this.poolSize));
+            config.setMaximumPoolSize(10);
+            config.setMinimumIdle(2);
             config.setUsername(this.username);
-            config.setPassword(this.password == null ? "" : this.password);
+            config.setPassword(this.password);
         }
 
         @Override
@@ -103,10 +92,8 @@ public final class MySQLBackend implements StorageBackend {
         @Override
         public String jsonValueExpression(String field, SortValueType valueType) {
             String expression = "JSON_UNQUOTE(JSON_EXTRACT(`data`, '$." + field + "'))";
-            return switch (valueType) {
-                case RAW, STRING -> expression;
-                case NUMBER -> "CAST(" + expression + " AS DECIMAL(65,20))";
-            };
+
+            return valueType == SortValueType.NUMBER ? "CAST(" + expression + " AS DECIMAL(65,20))" : expression;
         }
 
         @Override

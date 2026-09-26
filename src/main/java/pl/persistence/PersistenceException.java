@@ -1,6 +1,11 @@
 package pl.persistence;
 
-public class PersistenceException extends RuntimeException {
+import java.io.Serial;
+
+public final class PersistenceException extends RuntimeException {
+
+    @Serial
+    private static final long serialVersionUID = 1L;
 
     public PersistenceException(String message) {
         super(message);
@@ -8,5 +13,9 @@ public class PersistenceException extends RuntimeException {
 
     public PersistenceException(String message, Throwable cause) {
         super(message, cause);
+    }
+
+    public PersistenceException(Throwable cause) {
+        super(cause);
     }
 }

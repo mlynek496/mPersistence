@@ -5,16 +5,13 @@ import pl.persistence.query.SortValueType;
 
 import java.io.File;
 import java.math.BigDecimal;
+import java.util.Collection;
 import java.util.List;
 
 public final class SQLiteBackend implements StorageBackend {
-
     private final JdbcBackend backend;
 
     public SQLiteBackend(File file) {
-        if (file == null) {
-            throw new IllegalArgumentException("Database file cannot be null");
-        }
         this.backend = new JdbcBackend(new Dialect(file.getAbsoluteFile()));
     }
 
@@ -34,6 +31,11 @@ public final class SQLiteBackend implements StorageBackend {
     }
 
     @Override
+    public boolean exists(String entity, pl.persistence.query.QuerySpec query) {
+        return this.backend.exists(entity, query);
+    }
+
+    @Override
     public long count(String entity, pl.persistence.query.QuerySpec query) {
         return this.backend.count(entity, query);
     }
@@ -46,6 +48,11 @@ public final class SQLiteBackend implements StorageBackend {
     @Override
     public void save(StoredEntity entity) {
         this.backend.save(entity);
+    }
+
+    @Override
+    public void saveAll(Collection<StoredEntity> entities) {
+        this.backend.saveAll(entities);
     }
 
     @Override
@@ -71,10 +78,8 @@ public final class SQLiteBackend implements StorageBackend {
 
         @Override
         public void configure(HikariConfig config) {
-            config.setPoolName("mPersistence-SQLite");
             config.setMaximumPoolSize(1);
             config.setMinimumIdle(1);
-            config.setConnectionInitSql("PRAGMA foreign_keys = ON");
         }
 
         @Override
@@ -90,11 +95,8 @@ public final class SQLiteBackend implements StorageBackend {
         @Override
         public String jsonValueExpression(String field, SortValueType valueType) {
             String expression = "json_extract(`data`, '$." + field + "')";
-            return switch (valueType) {
-                case RAW -> expression;
-                case STRING -> "CAST(" + expression + " AS TEXT)";
-                case NUMBER -> "CAST(" + expression + " AS REAL)";
-            };
+
+            return valueType == SortValueType.NUMBER ? "CAST(" + expression + " AS REAL)" : expression;
         }
 
         @Override

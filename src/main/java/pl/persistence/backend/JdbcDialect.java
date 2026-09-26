@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariConfig;
 import pl.persistence.query.SortValueType;
 
 interface JdbcDialect {
+
     String jdbcUrl();
 
     void configure(HikariConfig config);

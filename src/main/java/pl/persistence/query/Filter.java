@@ -3,33 +3,31 @@ package pl.persistence.query;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.regex.Pattern;
 
 public record Filter(String field, Operator operator, Object value) {
 
-    private static final String FIELD_PATTERN = "[A-Za-z_][A-Za-z0-9_.]*";
-
     public Filter {
-        if (field == null || (!"_id".equals(field) && !field.matches(FIELD_PATTERN))) {
-            throw new IllegalArgumentException("Invalid filter field: " + field);
-        }
-        if (operator == null) {
-            throw new IllegalArgumentException("Filter operator cannot be null");
-        }
-        if (operator == Operator.IN) {
-            if (!(value instanceof Collection<?> values) || values.isEmpty()) {
-                throw new IllegalArgumentException("IN filter requires a non-empty collection");
-            }
-            List<Object> copy = new ArrayList<>(values.size());
-            for (Object entry : values) {
-                if (entry == null) {
-                    throw new IllegalArgumentException("IN filter does not support null values");
+        switch (operator) {
+            case IN -> {
+                if (!(value instanceof Collection<?> values) || values.isEmpty()) {
+                    throw new IllegalArgumentException("IN filter requires a non-empty collection");
                 }
-                copy.add(entry);
+                List<Object> copy = new ArrayList<>(values.size());
+                for (Object entry : values) {
+                    if (entry == null) {
+                        throw new IllegalArgumentException("IN filter does not support null values");
+                    }
+                    copy.add(entry);
+                }
+                value = List.copyOf(copy);
             }
-            value = List.copyOf(copy);
-        }
-        if ((operator == Operator.EXISTS || operator == Operator.IS_NULL || operator == Operator.IS_NOT_NULL) && value != null && !(value instanceof Boolean)) {
-            throw new IllegalArgumentException("Filter " + operator + " accepts only boolean metadata");
+            case EXISTS, IS_NULL, IS_NOT_NULL -> value = null;
+            case EQUAL, NOT_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL -> {
+                if (value == null) {
+                    throw new IllegalArgumentException("Filter value cannot be null for " + operator);
+                }
+            }
         }
     }
 
@@ -38,14 +36,14 @@ public record Filter(String field, Operator operator, Object value) {
     }
 
     public static Filter exists(String field) {
-        return new Filter(field, Operator.EXISTS, true);
+        return new Filter(field, Operator.EXISTS, null);
     }
 
     public static Filter isNull(String field) {
-        return new Filter(field, Operator.IS_NULL, true);
+        return new Filter(field, Operator.IS_NULL, null);
     }
 
     public static Filter isNotNull(String field) {
-        return new Filter(field, Operator.IS_NOT_NULL, true);
+        return new Filter(field, Operator.IS_NOT_NULL, null);
     }
 }

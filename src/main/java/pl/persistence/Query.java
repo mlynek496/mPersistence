@@ -9,7 +9,6 @@ import pl.persistence.query.SortValueType;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 
 public final class Query<T> {
     private final Database database;
@@ -26,10 +25,6 @@ public final class Query<T> {
 
     public FilterExpression<T> where(String field) {
         return new FilterExpression<>(this, field);
-    }
-
-    public FilterExpression<T> filter(String field) {
-        return this.where(field);
     }
 
     public Query<T> sort(String field, SortDirection direction) {
@@ -80,39 +75,37 @@ public final class Query<T> {
         return this;
     }
 
-    public CompletableFuture<List<T>> list() {
-        return this.database.submit(() -> this.database.executeInternal(this.type, this.spec()));
+    public List<T> list() {
+        return this.database.executeInternal(this.type, this.spec());
     }
 
-    public CompletableFuture<Optional<T>> first() {
+    public Optional<T> first() {
         QuerySpec query = new QuerySpec(this.filters, this.sorts, this.offset, 1);
-        return this.database.submit(() -> this.database.executeInternal(this.type, query).stream().findFirst());
+        List<T> result = this.database.executeInternal(this.type, query);
+        return result.isEmpty() ? Optional.empty() : Optional.of(result.getFirst());
     }
 
-    public CompletableFuture<Long> count() {
-        QuerySpec query = new QuerySpec(this.filters, List.of(), 0, 0);
-        return this.database.submit(() -> this.database.countInternal(this.type, query));
+    public long count() {
+        return this.database.countInternal(this.type, new QuerySpec(this.filters, List.of(), 0, 0));
     }
 
-    public CompletableFuture<Boolean> exists() {
-        QuerySpec query = new QuerySpec(this.filters, List.of(), 0, 1);
-        return this.database.submit(() -> !this.database.executeInternal(this.type, query).isEmpty());
+    public boolean exists() {
+        return this.database.existsInternal(this.type, new QuerySpec(this.filters, List.of(), 0, 1));
     }
 
-    public CompletableFuture<Long> delete() {
-        QuerySpec query = new QuerySpec(this.filters, List.of(), 0, 0);
-        return this.database.submit(() -> this.database.deleteByQueryInternal(this.type, query));
+    public long delete() {
+        return this.database.deleteByQueryInternal(this.type, new QuerySpec(this.filters, List.of(), 0, 0));
     }
 
-    public QuerySpec spec() {
-        return new QuerySpec(this.filters, this.sorts, this.offset, this.limit);
-    }
-
-    Query<T> add(Filter filter) {
+    public Query<T> add(Filter filter) {
         if (filter == null) {
             throw new IllegalArgumentException("Filter cannot be null");
         }
         this.filters.add(filter);
         return this;
+    }
+
+    public QuerySpec spec() {
+        return new QuerySpec(this.filters, this.sorts, this.offset, this.limit);
     }
 }
