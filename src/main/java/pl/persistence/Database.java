@@ -32,7 +32,9 @@ public final class Database implements AutoCloseable {
             throw exception;
         }
     }
-
+    public static Database sqlite(File file) {
+        return new Database(new SQLiteBackend(file), Database.defaultMapper());
+    }
 
     public static Database mysql(String host, int port, String database, String username, String password) {
         return new Database(new MySQLBackend(host, port, database, username, password), Database.defaultMapper());
