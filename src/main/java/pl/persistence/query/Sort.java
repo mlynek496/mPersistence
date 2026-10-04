@@ -6,6 +6,12 @@ public record Sort(String field, SortDirection direction, SortValueType valueTyp
         if (field == null || field.isBlank()) {
             throw new IllegalArgumentException("Sort field cannot be blank");
         }
+        if (direction == null) {
+            throw new IllegalArgumentException("Sort direction cannot be null");
+        }
+        if (valueType == null) {
+            throw new IllegalArgumentException("Sort value type cannot be null");
+        }
         field = field.trim();
     }
 

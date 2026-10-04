@@ -3,26 +3,27 @@ package pl.persistence;
 import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonParseException;
-import org.bson.types.Decimal128;
 import org.bson.types.Binary;
+import org.bson.types.Decimal128;
 import pl.persistence.annotation.Entity;
 import pl.persistence.annotation.Id;
 import pl.persistence.backend.StorageBackend;
 import pl.persistence.backend.StoredEntity;
 import pl.persistence.entity.EntityMetadata;
 import pl.persistence.query.QuerySpec;
-
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.math.BigDecimal;
 import java.math.BigInteger;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public final class Database implements AutoCloseable {
     private static final Pattern ENTITY_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]{0,63}");
@@ -36,19 +37,14 @@ public final class Database implements AutoCloseable {
     }
 
     public Database(StorageBackend backend, Gson gson) {
-        if (backend == null || gson == null) {
-            throw new IllegalArgumentException("Backend and Gson cannot be null");
-        }
-        this.backend = backend;
-        this.gson = gson;
-        this.backend.configureGson(gson);
-        this.backend.initialize();
+        this.backend = Objects.requireNonNull(backend, "Backend cannot be null");
+        this.gson = Objects.requireNonNull(gson, "Gson cannot be null");
+        backend.configureGson(gson);
+        backend.initialize();
     }
 
     public <T> Repository<T> repository(Class<T> type) {
-        this.ensureOpen();
-        EntityMetadata entityMetadata = this.metadata(type);
-        this.backend.initializeEntity(entityMetadata.name());
+        meta(type);
         return new Repository<>(this, type);
     }
 
@@ -59,222 +55,151 @@ public final class Database implements AutoCloseable {
         }
     }
 
-    public <T> T save(Class<T> type, T entity) {
-        this.ensureOpen();
+    public <T> void save(Class<T> type, T entity) {
+        EntityMetadata m = meta(type);
         if (entity == null) {
             throw new IllegalArgumentException("Entity cannot be null");
         }
-        EntityMetadata entityMetadata = this.metadata(type);
-        if (!entityMetadata.type().isInstance(entity)) {
-            throw new IllegalArgumentException("Entity type " + entity.getClass().getName() + " does not match repository type " + type.getName());
+        if (!m.type().isInstance(entity)) {
+            throw new IllegalArgumentException("Entity type " + entity.getClass().getName() + " does not match repository type " + m.type().getName());
         }
-        Object id = this.resolveId(entityMetadata, entity);
-        this.backend.save(new StoredEntity(entityMetadata.name(), id, this.gson.toJson(entity)));
-        return entity;
+        Object id = m.readId(entity);
+        if (id == null) {
+            throw new PersistenceException("Entity " + m.type().getName() + " has a null @Id");
+        }
+        this.backend.save(new StoredEntity(m.name(), id, this.gson.toJson(entity)));
     }
 
     public <T> Optional<T> findById(Class<T> type, Object id) {
-        this.ensureOpen();
-        EntityMetadata entityMetadata = this.metadata(type);
-        Object validatedId = this.validateId(entityMetadata, id);
-        return this.backend.findById(entityMetadata.name(), validatedId).map(stored -> this.deserialize(stored, entityMetadata, type));
+        EntityMetadata m = meta(type);
+        return this.backend.findById(m.name(), Database.validId(m, id)).map(s -> this.read(s, m, type));
     }
 
     public <T> List<T> find(Class<T> type, QuerySpec query) {
-        this.ensureOpen();
-        if (query == null) {
-            throw new IllegalArgumentException("Query cannot be null");
-        }
-        EntityMetadata entityMetadata = this.metadata(type);
-        List<StoredEntity> stored = this.backend.find(entityMetadata.name(), query);
-        List<T> result = new ArrayList<>(stored.size());
-        for (StoredEntity entity : stored) {
-            result.add(this.deserialize(entity, entityMetadata, type));
-        }
-        return result;
+        EntityMetadata m = meta(type);
+        return this.backend.find(m.name(), query).stream().map(s -> this.read(s, m, type)).collect(Collectors.toList());
     }
 
     public long count(Class<?> type, QuerySpec query) {
-        this.ensureOpen();
-        if (query == null) {
-            throw new IllegalArgumentException("Query cannot be null");
-        }
-        return this.backend.count(this.metadata(type).name(), query);
+        return this.backend.count(this.meta(type).name(), query);
     }
 
     public boolean exists(Class<?> type, QuerySpec query) {
-        this.ensureOpen();
-        if (query == null) {
-            throw new IllegalArgumentException("Query cannot be null");
-        }
-        return this.backend.exists(this.metadata(type).name(), query);
+        return this.backend.exists(this.meta(type).name(), query);
     }
 
     public long deleteWhere(Class<?> type, QuerySpec query) {
-        this.ensureOpen();
-        if (query == null) {
-            throw new IllegalArgumentException("Query cannot be null");
-        }
-        return this.backend.delete(this.metadata(type).name(), query);
+        return this.backend.delete(this.meta(type).name(), query);
     }
 
     public boolean existsById(Class<?> type, Object id) {
-        this.ensureOpen();
-        EntityMetadata entityMetadata = this.metadata(type);
-        return this.backend.existsById(entityMetadata.name(), this.validateId(entityMetadata, id));
+        EntityMetadata m = meta(type);
+        return this.backend.existsById(m.name(), Database.validId(m, id));
     }
 
     public boolean deleteById(Class<?> type, Object id) {
-        this.ensureOpen();
-        EntityMetadata entityMetadata = this.metadata(type);
-        return this.backend.deleteById(entityMetadata.name(), this.validateId(entityMetadata, id));
+        return this.backend.deleteById(this.meta(type).name(), Database.validId(this.meta(type), id));
     }
 
     public boolean deleteEntity(Class<?> type, Object entity) {
-        this.ensureOpen();
+        EntityMetadata m = meta(type);
         if (entity == null) {
             throw new IllegalArgumentException("Entity cannot be null");
         }
-        EntityMetadata entityMetadata = this.metadata(type);
-        if (!entityMetadata.type().isInstance(entity)) {
-            throw new IllegalArgumentException("Entity type " + entity.getClass().getName() + " does not match repository type " + type.getName());
+        if (!m.type().isInstance(entity)) {
+            throw new IllegalArgumentException("Entity type " + entity.getClass().getName() + " does not match repository type " + m.type().getName());
         }
-        Object id = entityMetadata.readId(entity);
-        if (id == null) {
-            return false;
-        }
-        return this.backend.deleteById(entityMetadata.name(), this.validateId(entityMetadata, id));
+        Object id = m.readId(entity);
+        return id != null && this.backend.deleteById(m.name(), Database.validId(m, id));
     }
 
-    private <T> T deserialize(StoredEntity stored, EntityMetadata entityMetadata, Class<T> type) {
-        try {
-            T value = this.gson.fromJson(stored.json(), type);
-            if (value == null) {
-                throw new PersistenceException("Cannot deserialize " + type.getName() + " with id " + stored.id() + ": JSON value is null");
-            }
-            entityMetadata.writeId(value, this.restoreId(stored.id(), entityMetadata.idType()));
-            return value;
-        } catch (JsonParseException | IllegalArgumentException exception) {
-            throw new PersistenceException("Cannot deserialize " + type.getName() + " with id " + stored.id(), exception);
-        }
-    }
-
-    private Object restoreId(Object value, Class<?> targetType) {
-        if (value == null) {
-            throw new PersistenceException("Cannot restore null @Id for " + targetType.getName());
-        }
-        Class<?> wrappedType = wrap(targetType);
-        if (wrappedType.isInstance(value)) {
-            return value;
-        }
-        if (value instanceof JsonElement json) {
-            try {
-                return this.gson.fromJson(json, targetType);
-            } catch (RuntimeException exception) {
-                throw new PersistenceException("Cannot restore @Id as " + targetType.getName(), exception);
-            }
-        }
-        if (value instanceof Decimal128 decimal128) {
-            if (BigDecimal.class.equals(targetType)) {
-                return decimal128.bigDecimalValue();
-            }
-            if (BigInteger.class.equals(targetType)) {
-                return decimal128.bigDecimalValue().toBigIntegerExact();
-            }
-        }
-        if (value instanceof Binary binary && byte[].class.equals(targetType)) {
-            return binary.getData();
-        }
-        try {
-            JsonElement json = this.gson.toJsonTree(value);
-            return this.gson.fromJson(json, targetType);
-        } catch (RuntimeException exception) {
-            throw new PersistenceException("Cannot restore @Id value as " + targetType.getName(), exception);
-        }
-    }
-
-    private Object resolveId(EntityMetadata entityMetadata, Object entity) {
-        Object id = entityMetadata.readId(entity);
-        if (id == null) {
-            throw new PersistenceException("Entity " + entityMetadata.type().getName() + " has a null @Id");
-        }
-        return id;
-    }
-
-    private Object validateId(EntityMetadata entityMetadata, Object id) {
-        if (id == null) {
-            throw new IllegalArgumentException("Id cannot be null");
-        }
-        if (!wrap(entityMetadata.idType()).isInstance(id)) {
-            throw new IllegalArgumentException("Id type " + id.getClass().getName() + " does not match @Id type " + entityMetadata.idType().getName());
-        }
-        return id;
-    }
-
-    private void ensureOpen() {
+    private EntityMetadata meta(Class<?> type) {
         if (this.closed.get()) {
             throw new IllegalStateException("Database is closed");
         }
+        return this.metadata.computeIfAbsent(type, this::createMetadata);
     }
 
-    private EntityMetadata metadata(Class<?> type) {
-        if (type == null) {
-            throw new IllegalArgumentException("Entity type cannot be null");
-        }
-        return this.metadata.computeIfAbsent(type, Database::createMetadata);
-    }
-
-    private static EntityMetadata createMetadata(Class<?> type) {
-        Entity annotation = type.getAnnotation(Entity.class);
-        if (annotation == null) {
+    private EntityMetadata createMetadata(Class<?> type) {
+        Entity entity = type.getAnnotation(Entity.class);
+        if (entity == null) {
             throw new PersistenceException("Class " + type.getName() + " must be annotated with @Entity");
         }
-        String name = annotation.value();
+        String name = entity.value();
         if (!ENTITY_NAME.matcher(name).matches()) {
             throw new PersistenceException("Invalid @Entity name '" + name + "' on " + type.getName() + " (use letters, digits and '_' only, starting with a letter or '_', max 64 characters)");
         }
-        return new EntityMetadata(type, name, findIdField(type));
+        Field id = getId(type);
+        this.backend.initializeEntity(name);
+        return new EntityMetadata(type, name, id);
     }
 
-    private static Field findIdField(Class<?> type) {
-        Field idField = null;
-        for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
-            for (Field field : current.getDeclaredFields()) {
-                if (!field.isAnnotationPresent(Id.class)) {
+    private static Field getId(Class<?> type) {
+        Field id = null;
+        for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Field f : c.getDeclaredFields()) {
+                if (!f.isAnnotationPresent(Id.class)) {
                     continue;
                 }
-                if (Modifier.isStatic(field.getModifiers())) {
-                    throw new PersistenceException("@Id field cannot be static: " + field);
+                int mods = f.getModifiers();
+                if (Modifier.isStatic(mods)) {
+                    throw new PersistenceException("@Id field cannot be static: " + f);
                 }
-                if (Modifier.isFinal(field.getModifiers())) {
-                    throw new PersistenceException("@Id field cannot be final: " + field);
+                if (Modifier.isFinal(mods)) {
+                    throw new PersistenceException("@Id field cannot be final: " + f);
                 }
-                if (idField != null) {
+                if (id != null) {
                     throw new PersistenceException("Multiple @Id fields in " + type.getName());
                 }
-                idField = field;
+                id = f;
             }
         }
-        if (idField == null) {
-            if (type != null) {
-                throw new PersistenceException("Class " + type.getName() + " must contain exactly one @Id field");
-            }
+        if (id == null) {
+            throw new PersistenceException("Class " + (type != null ? type.getName() : null) + " must contain exactly one @Id field");
         }
-        return idField;
+        return id;
+    }
+
+    private <T> T read(StoredEntity stored, EntityMetadata m, Class<T> type) {
+        try {
+            T value = gson.fromJson(stored.json(), type);
+            if (value == null) {
+                throw new PersistenceException("Cannot deserialize " + type.getName() + " with id " + stored.id() + ": JSON value is null");
+            }
+            m.writeId(value, restoreId(stored.id(), m.idType()));
+            return value;
+        } catch (JsonParseException | IllegalArgumentException e) {
+            throw new PersistenceException("Cannot deserialize " + type.getName() + " with id " + stored.id(), e);
+        }
+    }
+
+    private Object restoreId(Object value, Class<?> type) {
+        if (value == null) {
+            throw new PersistenceException("Cannot restore null @Id for " + type.getName());
+        }
+        if (Database.wrap(type).isInstance(value)) {
+            return value;
+        }
+        try {
+            return switch (value) {
+                case Decimal128 d when type == BigDecimal.class -> d.bigDecimalValue();
+                case Decimal128 d when type == BigInteger.class -> d.bigDecimalValue().toBigIntegerExact();
+                case Binary b when type == byte[].class -> b.getData();
+                default -> gson.fromJson(value instanceof JsonElement json ? json : gson.toJsonTree(value), type);
+            };
+        } catch (RuntimeException e) {
+            throw new PersistenceException("Cannot restore @Id as " + type.getName(), e);
+        }
+    }
+
+    private static Object validId(EntityMetadata m, Object id) {
+        if (!wrap(m.idType()).isInstance(id)) {
+            throw new IllegalArgumentException("Id type " + (id != null ? id.getClass().getName() : null) + " does not match @Id type " + (m.idType() != null ? m.idType().getName() : null));
+        }
+        return id;
     }
 
     private static Class<?> wrap(Class<?> type) {
-        if (!type.isPrimitive()) {
-            return type;
-        }
-        if (type == boolean.class) { return Boolean.class; }
-        if (type == byte.class) { return Byte.class; }
-        if (type == short.class) { return Short.class; }
-        if (type == int.class) { return Integer.class; }
-        if (type == long.class) { return Long.class; }
-        if (type == float.class) { return Float.class; }
-        if (type == double.class) { return Double.class; }
-        if (type == char.class) { return Character.class; }
-        return type;
+        return type.isPrimitive() ? MethodType.methodType(type).wrap().returnType() : type;
     }
 }

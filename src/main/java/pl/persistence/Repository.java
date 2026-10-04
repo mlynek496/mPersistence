@@ -15,8 +15,8 @@ public final class Repository<T> {
         this.type = type;
     }
 
-    public T save(T entity) {
-        return this.database.save(this.type, entity);
+    public void save(T entity) {
+        this.database.save(this.type, entity);
     }
 
     public Optional<T> findById(Object id) {
